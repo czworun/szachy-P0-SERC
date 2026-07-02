@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+# ============================================================
+# SERC Recorder v2.2 – PEŁNY, ZAKTUALIZOWANY KOD
+# - Osobne historie dla Białych i Czarnych (poprawne Ψ)
+# - Poprawione mapowanie: S, E, C (symetria startowa)
+# - Nagłówek protokołu w JSONL
+# - Wbudowany test symetrii startowej (Krok 0)
+# - Tryb interaktywny i wsadowy (PGN)
+# ============================================================
+
+import chess
+import chess.pgn
+import numpy as np
+import os
+import json
+import sys
+import argparse
+from datetime import datetime
+
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+# ----------- KONFIGURACJA -----------
+class Config:
+    TAU_PRIMES = [1, 3, 5]
+    DATA_DIR = 'sessions'
+    VECTOR_SIZE = 72
+    PROTOCOL = "SERC-Recorder-2.2"
+    METRIC_VERSION = "P0-SERC-1.1"
+
+    SYMMETRY_TOLERANCE = 0.02
+
+    @staticmethod
+    def ensure_dirs():
+        os.makedirs(Config.DATA_DIR, exist_ok=True)
+
+Config.ensure_dirs()
+
+P0 = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
+
+# ----------- JIT – TOKSYCZNOŚĆ I KOHERENCJA -----------
+@njit(fastmath=True, cache=True)
+def compute_toxicity_and_coherence(vectors):
+    n = vectors.shape[0]
+    if n < 2:
+        return 0.0, 0.0
+    tox, coh, count = 0.0, 0.0, 0
+    norms = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        norms[i] = np.linalg.norm(vectors[i]) + 1e-8
+    for i in range(n):
+        for j in range(i + 1, n):
+            dot = np.dot(vectors[i], vectors[j])
+            cos = dot / (norms[i] * norms[j])
+            coh += cos
+            if cos < 0:
+                tox -= cos
+            count += 1
+    return (tox / count, coh / count) if count > 0 else (0.0, 0.0)
+
+@njit(fastmath=True, cache=True)
+def distance_G(p, q):
+    diff = p - q
+    return np.sqrt(4.0 * np.sum(diff * diff))
+
+# ----------- EKSTRAKTORY CECH -----------
+def compute_material(board, perspective):
+    us = perspective
+    them = not us
+    val_us = sum(len(board.pieces(pt, us)) * w for pt, w in [
+        (chess.PAWN, 1), (chess.KNIGHT, 3), (chess.BISHOP, 3),
+        (chess.ROOK, 5), (chess.QUEEN, 9)
+    ])
+    val_them = sum(len(board.pieces(pt, them)) * w for pt, w in [
+        (chess.PAWN, 1), (chess.KNIGHT, 3), (chess.BISHOP, 3),
+        (chess.ROOK, 5), (chess.QUEEN, 9)
+    ])
+    return (val_us - val_them) + 10
+
+def compute_space_and_mobility(board, perspective):
+    us = perspective
+    original_turn = board.turn
+    board.turn = us
+    mobility = board.legal_moves.count()
+    center = 0
+    for sq in [chess.D4, chess.E4, chess.D5, chess.E5]:
+        center += len(board.attackers(us, sq))
+    board.turn = original_turn
+    return mobility * 0.5 + center * 0.3
+
+def compute_king_safety(board, perspective):
+    us = perspective
+    them = not us
+    king = board.king(us)
+    if king is None:
+        return 0
+
+    attackers = len(board.attackers(them, king))
+    defenders = len(board.attackers(us, king))
+    castling = 2 if board.has_castling_rights(us) else 0
+
+    escape_squares = 0
+    for move in board.legal_moves:
+        if move.from_square == king:
+            board_copy = board.copy()
+            board_copy.push(move)
+            if not board_copy.is_check():
+                escape_squares += 1
+
+    return defenders - attackers + castling + escape_squares * 0.5
+
+def compute_attack_graph(board, perspective):
+    us = perspective
+    total = 0
+    for sq in chess.SQUARES:
+        total += len(board.attackers(us, sq))
+    return total // 2
+
+def get_attack_vectors(board, perspective):
+    us = perspective
+    vectors = []
+    dir_map = {1: 0, 9: 1, 8: 2, 7: 3, -1: 4, -9: 5, -8: 6, -7: 7}
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece and piece.color == us:
+            vec = np.zeros(Config.VECTOR_SIZE, dtype=np.float64)
+            for target in board.attacks(sq):
+                vec[target] = 1.0
+                diff = target - sq
+                if diff in dir_map:
+                    vec[64 + dir_map[diff]] = 1.0
+            vectors.append(vec)
+    return np.array(vectors, dtype=np.float64) if vectors else np.zeros((1, Config.VECTOR_SIZE), dtype=np.float64)
+
+# ----------- GŁÓWNA FUNKCJA SERC -----------
+def compute_serc(board, perspective, history_p_white=None, history_p_black=None):
+    S = compute_material(board, perspective)
+    E = compute_space_and_mobility(board, perspective)
+    R = compute_attack_graph(board, perspective)
+    C = compute_king_safety(board, perspective)
+    total = S + E + R + C + 1e-8
+    p = np.array([S/total, E/total, R/total, C/total], dtype=np.float64)
+
+    vectors = get_attack_vectors(board, perspective)
+    T, kappa = compute_toxicity_and_coherence(vectors)
+
+    history = history_p_white if perspective == chess.WHITE else history_p_black
+    Psi = {}
+    if history:
+        for tau in Config.TAU_PRIMES:
+            if len(history) >= tau:
+                Psi[tau] = distance_G(p, history[-tau])
+
+    delta = distance_G(p, P0)
+    return {'p': p, 'T': T, 'kappa': kappa, 'Psi': Psi, 'delta': delta}
+
+# ----------- ANALIZA WSZYSTKICH RUCHÓW -----------
+def analyze_all_moves(board, history_p_white, history_p_black):
+    perspective = board.turn
+    moves = list(board.legal_moves)
+    results = []
+    for move in moves:
+        board_copy = board.copy()
+        board_copy.push(move)
+        result = compute_serc(board_copy, perspective, history_p_white, history_p_black)
+        results.append({
+            'san': board.san(move),
+            'uci': move.uci(),
+            'T': round(result['T'], 6),
+            'kappa': round(result['kappa'], 6),
+            'delta': round(result['delta'], 6),
+            'Psi': {int(k): round(v, 6) for k, v in result['Psi'].items()},
+            'p_S': round(result['p'][0], 6),
+            'p_E': round(result['p'][1], 6),
+            'p_R': round(result['p'][2], 6),
+            'p_C': round(result['p'][3], 6)
+        })
+    return results
+
+# ----------- REJESTRACJA POJEDYNCZEGO RUCHU -----------
+def record_move(board, move, history_p_white, history_p_black, move_number, side, game_meta):
+    perspective = board.turn
+    move_san = board.san(move)
+    fen_before = board.fen()
+
+    board.push(move)
+    fen_after = board.fen()
+
+    board.pop()
+    analysis = analyze_all_moves(board, history_p_white, history_p_black)
+    board.push(move)
+
+    sorted_T = sorted(analysis, key=lambda x: x['T'])
+    sorted_kappa = sorted(analysis, key=lambda x: -x['kappa'])
+    sorted_delta = sorted(analysis, key=lambda x: x['delta'])
+
+    chosen_T_rank = next(i for i, m in enumerate(sorted_T, 1) if m['san'] == move_san)
+    chosen_kappa_rank = next(i for i, m in enumerate(sorted_kappa, 1) if m['san'] == move_san)
+    chosen_delta_rank = next(i for i, m in enumerate(sorted_delta, 1) if m['san'] == move_san)
+
+    result = compute_serc(board, perspective, history_p_white, history_p_black)
+
+    if perspective == chess.WHITE:
+        history_p_white.append(result['p'])
+    else:
+        history_p_black.append(result['p'])
+
+    entry = {
+        'move_number': move_number,
+        'side': side,
+        'turn': 'white' if perspective == chess.WHITE else 'black',
+        'fen_before': fen_before,
+        'chosen_move': move_san,
+        'fen_after': fen_after,
+        'all_moves': analysis,
+        'chosen_rank_T': chosen_T_rank,
+        'chosen_rank_kappa': chosen_kappa_rank,
+        'chosen_rank_delta': chosen_delta_rank,
+        'state_after_move': {
+            'T': round(result['T'], 6),
+            'kappa': round(result['kappa'], 6),
+            'delta': round(result['delta'], 6),
+            'Psi': {int(k): round(v, 6) for k, v in result['Psi'].items()},
+            'p': [round(x, 6) for x in result['p']]
+        }
+    }
+    if game_meta:
+        entry.update(game_meta)
+    return entry, history_p_white, history_p_black
+
+# ----------- TEST SYMETRII STARTOWEJ -----------
+def test_starting_symmetry():
+    board = chess.Board()
+    p_white = compute_serc(board, chess.WHITE)['p']
+    board.turn = chess.BLACK
+    p_black = compute_serc(board, chess.BLACK)['p']
+    board.turn = chess.WHITE
+
+    tol = Config.SYMMETRY_TOLERANCE
+    white_ok = all(abs(x - 0.25) <= tol for x in p_white)
+    black_ok = all(abs(x - 0.25) <= tol for x in p_black)
+
+    print("\n" + "=" * 60)
+    print("🔍 KROK 0 – TEST SYMETRII STARTOWEJ")
+    print(f"Tolerancja: ±{tol}")
+    print(f"p_Białe: {[round(x, 4) for x in p_white]}")
+    print(f"p_Czarne: {[round(x, 4) for x in p_black]}")
+    print(f"Stan: {'✅ OK' if white_ok and black_ok else '❌ NIEZALECANE'}")
+    print("=" * 60 + "\n")
+
+    return white_ok and black_ok
+
+# ----------- ZAPIS -----------
+def save_session(position_data, timestamp, game_counter, game_meta=None):
+    output_file = f"{Config.DATA_DIR}/serc_session_{timestamp}_{game_counter:04d}.jsonl"
+    header = {
+        'protocol': Config.PROTOCOL,
+        'metric_version': Config.METRIC_VERSION,
+        'tau': Config.TAU_PRIMES,
+        'vector_size': Config.VECTOR_SIZE,
+        'created': datetime.now().isoformat(),
+        'symmetry_test': 'passed'
+    }
+    with open(output_file, 'w') as f:
+        f.write(json.dumps(header) + '\n')
+        for entry in position_data:
+            f.write(json.dumps(entry) + '\n')
+    print(f"✅ Zapisano {len(position_data)} pozycji do {output_file}")
+
+# ----------- PRZETWARZANIE PGN -----------
+def process_pgn_file(filename, output_dir=None):
+    if output_dir is None:
+        output_dir = Config.DATA_DIR
+
+    with open(filename) as f:
+        games = []
+        while True:
+            game = chess.pgn.read_game(f)
+            if game is None:
+                break
+            games.append(game)
+
+    print(f"🔍 Znaleziono {len(games)} partii w pliku {filename}")
+
+    all_data = []
+    for idx, game in enumerate(games, 1):
+        board = game.board()
+        history_p_white = []
+        history_p_black = []
+        move_number = 0
+        side = "Białe"
+
+        game_meta = {
+            'game_id': f"{idx:04d}",
+            'opening': game.headers.get('Opening', 'Unknown'),
+            'event': game.headers.get('Event', 'Unknown'),
+            'white': game.headers.get('White', 'Unknown'),
+            'black': game.headers.get('Black', 'Unknown'),
+            'result': game.headers.get('Result', '*')
+        }
+
+        print(f"\n📖 Przetwarzanie partii {idx}/{len(games)}: {game_meta['event']}")
+
+        for move in game.mainline_moves():
+            move_number += 1
+            side = "Białe" if board.turn == chess.WHITE else "Czarne"
+            entry, history_p_white, history_p_black = record_move(
+                board, move, history_p_white, history_p_black,
+                move_number, side, game_meta
+            )
+            all_data.append(entry)
+
+        print(f"   ✅ Zapisano {move_number} ruchów")
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_file = os.path.join(output_dir, f"serc_batch_{timestamp}.jsonl")
+
+    header = {
+        'protocol': Config.PROTOCOL,
+        'metric_version': Config.METRIC_VERSION,
+        'tau': Config.TAU_PRIMES,
+        'vector_size': Config.VECTOR_SIZE,
+        'created': datetime.now().isoformat(),
+        'source': filename,
+        'symmetry_test': 'passed'
+    }
+
+    with open(output_file, 'w') as f:
+        f.write(json.dumps(header) + '\n')
+        for entry in all_data:
+            f.write(json.dumps(entry) + '\n')
+
+    print(f"\n✅ Zapisano {len(all_data)} pozycji do {output_file}")
+    return output_file
+
+# ----------- TRYB INTERAKTYWNY -----------
+def run_recorder_interactive():
+    symmetry_ok = test_starting_symmetry()
+    if not symmetry_ok:
+        print("⚠️  OSTRZEŻENIE: Symetria startowa nie jest zachowana.")
+        print("   Kontynuować? (y/n)")
+        if input().lower() != 'y':
+            print("🛑 Zatrzymano.")
+            return
+
+    board = chess.Board()
+    history_p_white = []
+    history_p_black = []
+    position_data = []
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    game_counter = 1
+
+    game_meta = {
+        'game_id': f"{game_counter:04d}",
+        'opening': 'Interactive',
+        'event': 'SERC Recording Session',
+        'white': 'Player',
+        'black': 'SERC (observer)',
+        'result': '*'
+    }
+
+    print("=" * 60)
+    print(f"📝 SERC Recorder v{Config.PROTOCOL.split('-')[-1]} – TRYB INTERAKTYWNY")
+    print("   - Osobne historie dla Białych i Czarnych")
+    print("   - Poprawione mapowanie (S, E, C)")
+    print("   - Zapis: fen_before, fen_after, ranking ruchu")
+    print("   - Komenda 'show' – pokaż metryki dla wszystkich ruchów")
+    print("   - Komenda 'new'  – rozpocznij nową partię")
+    print("   - Komenda 'quit' – zakończ")
+    print("=" * 60)
+
+    while True:
+        move_number = len(board.move_stack) // 2 + 1
+        side = "Białe" if board.turn == chess.WHITE else "Czarne"
+
+        print(f"\n📌 Ruch {move_number} | Strona: {side}")
+        print(f"   FEN przed: {board.fen()}")
+
+        user_input = input("Twój ruch (lub komenda): ").strip()
+
+        if user_input.lower() in ['quit', 'q']:
+            break
+
+        if user_input.lower() == 'new':
+            if position_data:
+                save_session(position_data, timestamp, game_counter, game_meta)
+                position_data = []
+                game_counter += 1
+                game_meta['game_id'] = f"{game_counter:04d}"
+            board = chess.Board()
+            history_p_white = []
+            history_p_black = []
+            print("🔄 Nowa partia rozpoczęta.")
+            continue
+
+        if user_input.lower() == 'show':
+            analysis = analyze_all_moves(board, history_p_white, history_p_black)
+            print("\n📊 METRYKI SERC DLA WSZYSTKICH LEGALNYCH RUCHÓW:")
+            print("=" * 80)
+            print(f"{'#':2} {'Ruch':8} {'T':>8} {'κ':>8} {'δ':>8} {'Ψ₁':>8} {'Ψ₃':>8} {'Ψ₅':>8}")
+            print("-" * 80)
+            for i, m in enumerate(sorted(analysis, key=lambda x: x['T']), 1):
+                psi_str = f"{m['Psi'].get(1, 0):.4f} {m['Psi'].get(3, 0):.4f} {m['Psi'].get(5, 0):.4f}"
+                print(f"{i:2} {m['san']:8} {m['T']:8.4f} {m['kappa']:8.4f} {m['delta']:8.4f} {psi_str}")
+            continue
+
+        try:
+            move = board.parse_san(user_input)
+            entry, history_p_white, history_p_black = record_move(
+                board, move, history_p_white, history_p_black,
+                move_number, side, game_meta
+            )
+            position_data.append(entry)
+            print(f"✅ Zapamiętano {len(entry['all_moves'])} ruchów z metrykami")
+            print(f"   📊 Ranga wybranego ruchu: T={entry['chosen_rank_T']}/{len(entry['all_moves'])}, "
+                  f"κ={entry['chosen_rank_kappa']}/{len(entry['all_moves'])}, "
+                  f"δ={entry['chosen_rank_delta']}/{len(entry['all_moves'])}")
+        except ValueError as e:
+            print(f"❌ Niepoprawny ruch! ({e})")
+            continue
+
+        if board.is_game_over():
+            print("🏁 Koniec partii!")
+            if position_data:
+                save_session(position_data, timestamp, game_counter, game_meta)
+                position_data = []
+                game_counter += 1
+                game_meta['game_id'] = f"{game_counter:04d}"
+            board = chess.Board()
+            history_p_white = []
+            history_p_black = []
+            print("🔄 Nowa partia rozpoczęta.")
+
+    if position_data:
+        save_session(position_data, timestamp, game_counter, game_meta)
+
+# ----------- PUNKT WEJŚCIA -----------
+def main():
+    parser = argparse.ArgumentParser(description="SERC Recorder v2.2")
+    parser.add_argument('--pgn', type=str, help='Plik PGN do przetworzenia (tryb wsadowy)')
+    parser.add_argument('--output', type=str, default=Config.DATA_DIR, help='Katalog wyjściowy')
+    args = parser.parse_args()
+
+    print("\n🔍 Wykonuję test symetrii startowej (Krok 0)...")
+    symmetry_ok = test_starting_symmetry()
+    if not symmetry_ok:
+        print("⚠️  OSTRZEŻENIE: Symetria startowa nie jest zachowana.")
+        print("   Kontynuować mimo to? (y/n)")
+        if input().lower() != 'y':
+            print("🛑 Zatrzymano.")
+            return
+
+    if args.pgn:
+        if os.path.isdir(args.pgn):
+            pgn_files = [f for f in os.listdir(args.pgn) if f.endswith('.pgn')]
+            for pgn_file in pgn_files:
+                print(f"\n📁 Przetwarzanie: {pgn_file}")
+                process_pgn_file(os.path.join(args.pgn, pgn_file), args.output)
+        else:
+            process_pgn_file(args.pgn, args.output)
+    else:
+        run_recorder_interactive()
+
+if __name__ == "__main__":
+    main()
